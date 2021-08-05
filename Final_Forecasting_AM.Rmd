@@ -1,0 +1,1258 @@
+---
+title: "DAPT Forecasting Project"
+author: "Aastha Malhotra"
+date: "7/14/2021"
+output: 
+#  slidy_presentation: default
+  word_document: default
+#  powerpoint_presentation: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+# libraries --------------------
+library(fpp3)
+library(dplyr)
+library(pander)
+library(ggthemes)
+library(purrr)
+library(ggsci)
+library(ggplot2)
+library(readr)
+options(scipen = 1000)
+
+# set pander table-layout options --------
+panderOptions('table.alignment.default', function(df)
+  ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+
+# import the file -------
+land_temps <- read_csv("/Users/aasthamalhotra/Documents/Forecasting/GlobalLandTemperaturesByState.csv")
+
+# data cleaning---------
+# first, look at col types
+str(land_temps)
+
+# get column names:
+(col_names <- names(land_temps))
+
+# update the col names for consistent formatting
+names(land_temps) <- tolower(names(land_temps))
+
+names(land_temps)[names(land_temps) == 'dt'] <- 'date'
+
+names(land_temps)[names(land_temps) == 'averagetemperature'] <- 'avg_temps'
+
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# hidden section to ensure all functions are available when needed regardless of the run order for other code chunks.
+
+#Function to set the training and testing window
+train_test_fn = function(region_df) {
+  train <- region_df %>%
+    filter(as.Date(year_month) < '2003-01-01')
+  
+  test <- region_df %>%
+    filter(as.Date(year_month) >= '2003-01-01')
+  
+  train_test = list(train,test)
+  return(train_test)
+}
+
+#ETS model function
+ETS_fn = function(region_df){
+  ets_fit <- region_df %>%
+    model(ETS(avg_temp))
+  pander(report(ets_fit))
+}
+
+# FUNCTION for ARIMA Models--
+#function to get the best arima model
+arima.fn = function(region_df, region_orig) {
+  df <- data.frame(p=integer(),
+                   q=integer(), 
+                   P=integer(), 
+                   Q=integer(),
+                   aic = double(),
+                   stringsAsFactors=FALSE) 
+  
+  for(p in 0:3){
+    for(q in 0:3){
+      for(P in 0:3){
+        for(Q in 0:3){
+          fit <- region_df %>% model(ARIMA(avg_temp ~ pdq(p, 0, q) + PDQ(P, 1, Q)))
+          aic <- glance(fit)$AICc
+          if (!is.null(aic)) {
+            df_new = data.frame(p, q, P, Q, aic)
+            df = rbind(df, df_new)
+          }
+        }
+      }
+    }
+  }
+  
+  df = df %>% arrange(aic)
+  
+  models <- region_df %>%
+    model(best_arima = ARIMA(avg_temp ~ pdq(df$p[1], 0, df$q[1]) + PDQ(df$P[1], 1, df$Q[1])),
+          auto_arima = ARIMA(avg_temp),
+          arima1  = ARIMA(avg_temp ~ pdq(df$p[2], 0, df$q[2]) + PDQ(df$P[2], 1, df$Q[2])),
+          arima2  = ARIMA(avg_temp ~ pdq(df$p[3], 0, df$q[3]) + PDQ(df$P[3], 1, df$Q[3])),
+          arima3  = ARIMA(avg_temp ~ pdq(df$p[4], 0, df$q[4]) + PDQ(df$P[4], 1, df$Q[4])),
+          additive_ets   = ETS(avg_temp   ~ error('A') + trend('N') + season('A')),
+          additive_damped   = ETS(avg_temp   ~ error('A') + trend('Ad') + season('A'))
+    )
+  pander(models %>% pivot_longer(!region, names_to = "Model name",
+                                 values_to = "Orders"))
+  
+  pander(glance(models) %>% arrange(AICc) %>% select(.model:BIC))
+  
+  best_models_list = as.data.frame(glance(models) %>% arrange(AICc) %>% select(.model:BIC)) %>% 
+    arrange(AICc)
+  return(best_models_list)
+  
+} #--end of function
+
+#function for forecast--this will give the accuracy score and forecast plot
+forecast_fn = function(model, region_orig){
+   forecast = model%>%
+    forecast(h= '10 years') 
+  
+   print(forecast %>% accuracy(region_orig) )
+   forecast %>% autoplot(region_orig, colour = 'maroon', size = 0.8)
+}
+```
+
+## US Land Temperatures from 1913 - 2013
+
+I selected the Kaggle dataset: “Climate Change: Earth Surface Temperature Data,” which summarizes the average land temperature across states by country around the world. In this project, my goal is to analyze temperatures in different regions of the United States and make forecasts.
+
+Source: https://www.kaggle.com/berkeleyearth/climate-change-earth-surface-temperature-data/code 
+
+
+## Description of the Dataset
+
+The dataset includes the following columns:
+- Date
+- Average Temperature
+- State
+- Country
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# create a filtered dataframe for the us
+# 149745 rows returned
+us_temps <- land_temps %>%
+  dplyr::filter(country == 'United States') %>%
+  select(-country, -averagetemperatureuncertainty)
+
+# to deal with the date/time funkiness in windows, make date field a date and also drop pre-1900's dates formatted with - instead of /
+us_temps$date <- as.Date(us_temps$date, '%m/%d/%Y')
+
+# get the names of each us state in the df
+us_states <- unique(us_temps$state)
+
+pander(us_states)
+
+```
+
+## Data Cleaning Process
+
+I started with 645,675 observations. After filtering down to observations in the United States, I have 149,745 rows. I created groups for each climate region. Then I filtered the dates to observations between 1913 and 2013. Next, I created groups for each temperature region (source: https://www.ducksters.com/geography/us_states/us_geographical_regions.php).
+
+
+**Regions:**
+- North East
+- West
+- South East
+- South West
+- Midwest
+
+
+```{r new_groups, message=FALSE, warning=FALSE}
+
+north_east <- c('Connecticut', 'Delaware', 'District Of Columbia', 'Maine', 'Maryland', 
+                'Massachusetts', 'New Hampshire', 'New Jersey', 'New York', 'Pennsylvania', 
+                'Rhode Island', 'Vermont', 'Virginia', 'West Virginia')
+
+west       <- c('Alaska', 'Idaho', 'Montana', 'Oregon','Washington', 'Wyoming', 'California', 
+                'Hawaii', 'Nevada')
+
+south_east <- c('Alabama', 'Arkansas', 'Florida', 'Georgia (State)', 'Louisiana', 'Mississippi',
+                'North Carolina', 'South Carolina', 'Tennessee')
+
+south_west <- c('Arizona', 'Colorado', 'New Mexico', 'Oklahoma', 'Texas', 'Utah')
+
+midwest    <- c('Illinois', 'Indiana', 'Iowa', 'Kansas', 'Kentucky', 'Michigan', 'Minnesota', 
+                'Missouri', 'Nebraska', 'North Dakota', 'Ohio', 'South Dakota', 'Wisconsin')
+
+```
+
+
+```{r}
+# create a df which includes the region
+# 149,745 observations
+us_regions <- us_temps %>% 
+  mutate(region = case_when(
+    state %in% north_east ~ 'north_east',
+    state %in% south_east ~ 'south_east',
+    state %in% south_west ~ 'south_west',
+    state %in% midwest    ~ 'midwest',
+    state %in% west       ~ 'west'))
+```
+
+# Create a Timeseries Object
+
+Preparing to create a time-series object, I filtered the data to include observations between January 1, 1913, and December 31, 2012. I dropped the State column from the dataframe  and took the average by region by month.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+us_regions_ts <- us_regions %>%
+  mutate(year_month = yearmonth(date)) %>%
+  dplyr::filter(date >= '1913-01-01' & date < '2013-01-01') %>%
+  select(-state, -date) %>%
+  group_by(region, year_month) %>%
+  summarise(avg_temp = mean(avg_temps, na.rm = TRUE)) %>%
+  as_tsibble(key = c(region),
+             index = year_month)
+```
+
+Create dataframes for each region for ease of use.
+
+```{r}
+# for ease of use later, creating dfs for each region
+# 1200 observations in each
+# Create df for each region
+north_east <- us_regions_ts %>%
+  filter(region == 'north_east')
+
+west <- us_regions_ts %>%
+  filter(region == 'west')
+
+south_east <- us_regions_ts %>%
+  filter(region == 'south_east')
+
+south_west <- us_regions_ts %>%
+  filter(region == 'south_west')
+
+midwest <- us_regions_ts %>%
+  filter(region == 'midwest')
+```
+
+# Setting the Test and Train Data to use for various regions
+
+I created a function(shown in the appendix in the end) to split the data into a training dataset and test dataset:
+ 
+ - Train dataset: January 1913 to December 2002
+ - Test dataset:  January 2003 to December 2012
+ 
+# I have also defined additional 3 functions(all functions shown in the appendix in the end--
+a. Function for auto ETS
+
+b. Function to obtain AICc using auto Arima, other plausible ARIMA models and plausible ETS models--
+
+This function loops through all plausible values of p, q, P, Q parameters used in ARIMA function with values ranging from 0 to 3. The 4 best ARIMA models with the lowest AICc values are then compared with auto.arima and two other ETS models (ANA and A,Ad,A).This function helps in evaluating the best model based on AICc and if the best arima model selected is based on acf and pacf plots.
+
+c. Forecast function -  generates accuracy scores and plots the forecast
+
+## Looking at each region I see strong seasonality
+
+All regions follow a similar seasonal pattern. The North East is the largest composite group, representing a range of temperatures from -8.874 to 24.075. Looking at this plot, I see that the South East, South West, and Western regions experiences milder winters, while the Midwest and North East experiences a wider range of highs and lows. The temperatures are highest in the South East region.
+
+# auto plots of all the regions
+```{r echo=TRUE, fig.show="hold", message=FALSE, warning=FALSE, out.width="90%"}
+us_regions_ts %>%
+autoplot(avg_temp)
+```
+
+# Plotting all the regions with gg_season
+```{r}
+us_regions_ts %>%
+  gg_season(avg_temp,
+            labels = 'right') + 
+  labs(title = 'Average Temperatures by US Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month') +
+  theme_fivethirtyeight() 
+```
+
+# Plotting all the regions with gg_subseries
+```{r}
+us_regions_ts %>%
+  gg_subseries(avg_temp,
+               colour = 'darkslategrey')
+```
+
+# Looking at the West Region
+
+```{r echo=TRUE, fig.show="hold", message=FALSE, warning=FALSE, out.width="50%"}
+#autoplot for West region
+west %>%
+  autoplot(avg_temp, 
+           colour = 'dodgerblue3')+ 
+  labs(title = 'Average Temperatures West Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+
+#gg_season for west region
+west %>%
+  gg_season(avg_temp,
+            labels = 'right') + 
+  labs(title = 'Average Temperatures by US Region',
+       subtitle = 'West: 1913 - 2012',
+       y = 'avg_temp',
+       x = 'Year, Month') +
+  theme_fivethirtyeight() 
+
+#gg_subseries for west region
+west %>%
+  gg_subseries(avg_temp, 
+               colour = 'dodgerblue3')+ 
+  labs(title = 'Average Temperatures West Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+```
+
+# Perform an STL decomposition on West region
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+stl_west_decom <- west %>%
+  model(STL(avg_temp ~ trend(window = 21) +
+              season(window = 13),
+            robust = TRUE)) %>%
+  components()
+autoplot(stl_west_decom, color ='dodgerblue3') + 
+  xlab('Year') + 
+  ylab('Avg Temperature') +
+  ggtitle('STL Decomposition: USA West Coast Temperature')
+```
+
+# Looking at the stationarity of the data followed by Model building
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Partial ACF Plot: West US, No Differencing
+west %>%
+  gg_tsdisplay(avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of West US Temps (no differencing)')
+```
+
+# Addressing the stationarity
+Perform nsdiffs test to determine if we need a seasonal difference
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# test the nsdiffs
+pander(west %>%
+         features(avg_temp, 
+                  unitroot_nsdiffs))
+
+seasonal_diff_temps <-  west %>%
+  mutate(diff12_avg_temp = difference(avg_temp, 12))
+
+# Test if additional differencing is needed
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp,
+                  unitroot_ndiffs))
+
+# Final confirmation with KPSS Test
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp, 
+                  unitroot_kpss))
+
+# Autoplot of the Seasonally Differenced Data
+seasonal_diff_temps %>%
+  filter(region == 'west') %>%
+  autoplot(diff12_avg_temp,
+           colour = 'dodgerblue3') +
+  labs(title = 'Seasonally Differenced Avg Temp',
+       subtitle = 'Western Region') +
+  theme_fivethirtyeight()
+```
+
+# Partial ACF Plot of West US Temps, Seasonal Difference Applied
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+seasonal_diff_temps %>%
+  filter(region == 'west') %>%
+  gg_tsdisplay(diff12_avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of Western US Temps',
+       subtitle = 'Seasonal difference')
+```
+
+#FITTING MODELS--West REGION
+Calling the train,test,function defined (check the appendix)
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_west = train_test_fn(west)[[1]]
+test_west = train_test_fn(west)[[2]]
+```
+
+#FITTING ETS MODEL--West REGION
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#autofit ETS--CALLING THE (AUTO) ETS FUNCTION defined (check the appendix)
+ets_fit_west = ETS_fn(train_west)
+
+#fit the best ETS-For West it is (A,N,A)
+west_holt_fit <- train_west %>%
+  model(
+    additive = ETS(avg_temp ~ error("A") + trend("N") + season("A"))
+  ) 
+
+#Check the residuals for white noise
+gg_tsresiduals(west_holt_fit)
+
+#L jung test to confirm white noise
+augment(west_holt_fit) %>% features(.innov, ljung_box, lag=24, dof=15)
+
+#Forecast for west--(Calling the function we defined (check the appendix))
+#The output is accuracy scores and forecast graph
+forecast_fn(west_holt_fit, west)
+```
+
+#FIT ARIMA MODELS for west region by calling the functions (shown in appendix)
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#call the ARIMA function for West region--
+best_west_model = arima.fn(train_west, west)
+```
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#plot the residuals for the best model
+model_west = train_west %>% model(ARIMA(avg_temp ~ pdq(2, 0, 0) + PDQ(3, 1, 0)))
+report(model_west)
+
+#Residual diagnostics
+gg_tsresiduals(model_west)
+
+#Check if the residuals have white noise by l_jung test-- 
+augment(model_west) %>% features(.innov, ljung_box, lag=36, dof=6)
+```
+
+# Forecast
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#Calling the forecast function(defined (check the appendix))--this plots the forecasts and gives the accuracy scores
+forecast_fn(model_west, west)
+```
+
+#CROSS VALIDATION
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+print('West Cross Validation')
+west%>%
+  stretch_tsibble(.init = 10) %>%
+  model(
+    additive = ETS(avg_temp ~ error("A") + trend("N") + season("A")),
+    best_arima = ARIMA(avg_temp ~ pdq(2, 0, 0) + PDQ(3, 1, 0))
+  ) %>%
+  forecast(h = 1) %>%
+  accuracy(west) %>%
+  select(.model, RMSE:MAPE)
+```
+
+# Looking at the North east Region
+
+Start by looking at all the plots
+
+```{r echo=FALSE, fig.show="hold", message=FALSE, warning=FALSE, out.width="50%"}
+#autoplot for north east region
+north_east %>%
+  autoplot(avg_temp, 
+           colour = 'maroon')+ 
+  labs(title = 'Average Temperatures north_east Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+
+#gg_season for north east region
+north_east %>%
+  gg_season(avg_temp,
+            labels = 'right') + 
+  labs(title = 'Average Temperatures by US Region',
+       subtitle = 'North East: 1913 - 2012',
+       y = 'avg_temp',
+       x = 'Year, Month') +
+  theme_fivethirtyeight() 
+
+#gg_subseries for north east region
+north_east %>%
+  gg_subseries(avg_temp, 
+               colour = 'maroon')+ 
+  labs(title = 'Average Temperatures north_east Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+```
+
+# Perform an STL decomposition on Northeast region
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+stl_north_east_decom <- north_east %>%
+  model(STL(avg_temp ~ trend(window = 21) +
+              season(window = 13),
+            robust = TRUE)) %>%
+  components()
+autoplot(stl_north_east_decom, color ='maroon') + 
+  xlab('Year') + 
+  ylab('Avg Temperature') +
+  ggtitle('STL Decomposition: USA North East Coast Temperature')
+```
+
+# Looking at the stationarity of the data followed by Model building
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Partial ACF Plot: North East US, No Differencing
+north_east %>%
+  gg_tsdisplay(avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of NE US Temps (no differencing)')
+```
+
+# Addressing the stationarity
+Perform nsdiffs test to determine if we need a seasonal difference
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# test the nsdiffs
+pander(north_east %>%
+         features(avg_temp, 
+                  unitroot_nsdiffs))
+
+seasonal_diff_temps <-  north_east %>%
+  mutate(diff12_avg_temp = difference(avg_temp, 12))
+
+# Test if additional differencing is needed
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp,
+                  unitroot_ndiffs))
+
+# Final confirmation with KPSS Test
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp, 
+                  unitroot_kpss))
+
+# Autoplot of the Seasonally Differenced Data
+seasonal_diff_temps %>%
+  filter(region == 'north_east') %>%
+  autoplot(diff12_avg_temp,
+           colour = 'darkorange3') +
+  labs(title = 'Seasonally Differenced Avg Temp',
+       subtitle = 'North Eastern Region') +
+  theme_fivethirtyeight()
+```
+
+# Partial ACF Plot of North East US Temps, Seasonal Difference Applied
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+seasonal_diff_temps %>%
+  filter(region == 'north_east') %>%
+  gg_tsdisplay(diff12_avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of North Eastern US Temps',
+       subtitle = 'Seasonal difference')
+```
+
+# ETS for North East region--calling the train,test,function defined (check the appendix)
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_NE = train_test_fn(north_east)[[1]]
+test_NE = train_test_fn(north_east)[[2]]
+```
+
+# FIT ETS MODEL--North East REGION
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#ETS for North East region--calling the train,test,function defined (check the appendix)
+ets_fit_NE = ETS_fn(train_NE)
+
+#fit the best ETS-For NE it is (A,Ad,A)
+NE_holt_fit <- train_NE %>%
+  model(
+    additive_damped = ETS(avg_temp ~ error("A") + trend("Ad") + season("A"))
+  ) 
+
+#Check the residuals for white noise
+gg_tsresiduals(NE_holt_fit)
+
+#L jung test to confirm white noise
+augment(NE_holt_fit) %>% features(.innov, ljung_box, lag=24, dof=17)
+
+#Forecast for north_east--(Calling the function we defined (check the appendix))
+#The outut is accuracy scores and forecast graph
+forecast_fn(NE_holt_fit, north_east)
+```
+
+# FIT ARIMA MODELS for North East region by calling the functions (shown in the appendix)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#call the ARIMA function for North East region--
+best_NE_model = arima.fn(train_NE, north_east)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Fit the best Model
+model_NE = train_NE %>% model(ARIMA(avg_temp ~ pdq(1, 0, 0) + PDQ(3, 1, 0)))
+report(model_NE)
+
+#Residual diagnostics
+gg_tsresiduals(model_NE)
+
+#Check if the residuals have white noise by l_jung test-- prof said even if its not white noise, check residual diagnostics for both and then decide for both
+augment(model_NE) %>% features(.innov, ljung_box, lag=36, dof=5)
+```
+
+# Forecast
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Calling the forecast function(defined (check the appendix))--this plots the forecasts and gives the accuracy scores
+forecast_fn(model_NE, north_east)
+```
+
+#CROSS VALIDATION
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+print('North East CV')
+north_east%>%
+  stretch_tsibble(.init = 10) %>%
+  model(
+    additive_damped = ETS(avg_temp ~ error("A") + trend("Ad") + season("A")),
+    best_arima = ARIMA(avg_temp ~ pdq(1, 0, 0) + PDQ(3, 1, 0))
+  ) %>%
+  forecast(h = 1) %>%
+  accuracy(north_east) %>%
+  select(.model, RMSE:MAPE)
+```
+
+#Let us look at region South East region
+Start by looking at all the plots
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#autoplot for South East region
+south_east %>%
+  autoplot(avg_temp, 
+           colour = 'seagreen')+ 
+  labs(title = 'Average Temperatures South East Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+
+#gg_season for South East region
+south_east %>%
+  gg_season(avg_temp,
+            labels = 'right') + 
+  labs(title = 'Average Temperatures by US Region',
+       subtitle = 'South_East: 1913 - 2012',
+       y = 'avg_temp',
+       x = 'Year, Month') +
+  theme_fivethirtyeight() 
+
+#gg_subseries for South East region
+south_east %>%
+  gg_subseries(avg_temp, 
+               colour = 'seagreen')+ 
+  labs(title = 'Average Temperatures South East Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+```
+
+# Perform an STL decomposition on South East region
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+stl_SE_decom <- south_east %>%
+  model(STL(avg_temp ~ trend(window = 21) +
+              season(window = 13),
+            robust = TRUE)) %>%
+  components()
+autoplot(stl_SE_decom, color ='seagreen') + 
+  xlab('Year') + 
+  ylab('Avg Temperature') +
+  ggtitle('STL Decomposition: USA South East Coast Temperature')
+```
+
+# Looking at the stationarity of the data followed by Model building
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Partial ACF Plot: South East US, No Differencing
+south_east %>%
+  gg_tsdisplay(avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of South East US Temps (no differencing)')
+```
+
+# Addressing the stationarity
+Perform nsdiffs test to determine if we need a seasonal difference
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# test the nsdiffs
+pander(south_east %>%
+         features(avg_temp, 
+                  unitroot_nsdiffs))
+
+seasonal_diff_temps <-  south_east %>%
+  mutate(diff12_avg_temp = difference(avg_temp, 12))
+
+# Test if additional differencing is needed
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp,
+                  unitroot_ndiffs))
+
+# Final confirmation with KPSS Test
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp, 
+                  unitroot_kpss))
+
+# Autoplot of the Seasonally Differenced Data
+seasonal_diff_temps %>%
+  filter(region == 'south_east') %>%
+  autoplot(diff12_avg_temp,
+           colour = 'seagreen') +
+  labs(title = 'Seasonally Differenced Avg Temp',
+       subtitle = 'South Eastern Region') +
+  theme_fivethirtyeight()
+```
+
+# Partial ACF Plot of South East US Temps, Seasonal Difference Applied
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+seasonal_diff_temps %>%
+  filter(region == 'south_east') %>%
+  gg_tsdisplay(diff12_avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of South Eastern US Temps',
+       subtitle = 'Seasonal difference')
+```
+
+#FITTING MODELS--South East REGION
+Calling the train,test,function defined (check the appendix)
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_SE = train_test_fn(south_east)[[1]]
+test_SE = train_test_fn(south_east)[[2]]
+```
+
+# FIT ETS MODEL--
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#ETS MODEL
+#autofit ETS--CALLING THE (AUTO) ETS FUNCTION defined (check the appendix)
+ets_fit_SE = ETS_fn(train_SE)
+
+#fit the best ETS-For South East it is (A,Ad,A)
+SE_holt_fit <- train_SE %>%
+  model(
+    additive_damped = ETS(avg_temp ~ error("A") + trend("Ad") + season("A"))
+  ) 
+
+#Check the residuals for white noise
+gg_tsresiduals(SE_holt_fit)
+
+#L jung test to confirm white noise
+augment(SE_holt_fit) %>% features(.innov, ljung_box, lag=24, dof=17)
+```
+
+#Forecast
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Forecast for South East--(Calling the function we defined (check the appendix))
+#The output is accuracy scores and forecast graph
+forecast_fn(SE_holt_fit, south_east)
+```
+
+#FIT ARIMA MODELS for South East region by calling the functions (shown in the appendix)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#call the ARIMA function for South East region--
+best_SE_model = arima.fn(train_SE, south_east)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#plot the best model
+model_SE = train_SE %>% model(ARIMA(avg_temp ~ pdq(1, 0, 0) + PDQ(3, 1, 0)))
+report(model_SE)
+
+#Residual diagnostics
+gg_tsresiduals(model_SE)
+
+#Check if the residuals have white noise by l_jung test-- prof said even if its not white noise, check residual diagnostics for both and then decide for both
+augment(model_SE) %>% features(.innov, ljung_box, lag=36, dof=5)
+```
+
+# Forecast
+
+The forcast function below gives the RMSE for best arima which is 1.48 and the RMSE that auto ETS 
+model gives us 1.40, and looking at the residual diagnostics from both,
+it can be concluded that best_ARIMA-- <ARIMA(1,0,0)(3,1,0)[12]> might be the best model.
+But of course need to do the cross validation--you can find the code in the end for that
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Calling the forecast function(defined (check the appendix))--this plots the forecasts and gives the accuracy scores
+forecast_fn(model_SE, south_east)
+```
+
+# CROSS VALIDATION
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, eval= FALSE}
+print('South East CV')
+south_east%>%
+  stretch_tsibble(.init = 10) %>%
+  model(
+    additive_damped = ETS(avg_temp ~ error("A") + trend("Ad") + season("A")),
+    best_arima = ARIMA(avg_temp ~ pdq(1, 0, 0) + PDQ(3, 1, 0))
+  ) %>%
+  forecast(h = 1) %>%
+  accuracy(south_east) %>%
+  select(.model, RMSE:MAPE)
+```
+
+# Looking at the South West region
+
+Start by looking at all the plots
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#autoplot for South West region
+south_west %>%
+  autoplot(avg_temp, 
+           colour = 'orange3')+ 
+  labs(title = 'Average Temperatures South West Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+
+#gg_season for South West region
+south_west %>%
+  gg_season(avg_temp,
+            labels = 'right') + 
+  labs(title = 'Average Temperatures by US Region',
+       subtitle = 'South_West: 1913 - 2012',
+       y = 'avg_temp',
+       x = 'Year, Month') +
+  theme_fivethirtyeight() 
+
+#gg_subseries for South West region
+south_west %>%
+  gg_subseries(avg_temp, 
+               colour = 'orange3')+ 
+  labs(title = 'Average Temperatures South West Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+```
+
+# Perform an STL decomposition on South West region
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+stl_SW_decom <- south_west %>%
+  model(STL(avg_temp ~ trend(window = 21) +
+              season(window = 13),
+            robust = TRUE)) %>%
+  components()
+autoplot(stl_SW_decom, color ='orange3') + 
+  xlab('Year') + 
+  ylab('Avg Temperature') +
+  ggtitle('STL Decomposition: USA South West Coast Temperature')
+```
+
+# Looking at the stationarity of the data followed by Model building
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Partial ACF Plot: South West US, No Differencing
+south_west %>%
+  gg_tsdisplay(avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of South West US Temps (no differencing)')
+```
+
+# Addressing the stationarity
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Perform nsdiffs test to determine if we need a seasonal difference
+# test the nsdiffs
+pander(south_west %>%
+         features(avg_temp, 
+                  unitroot_nsdiffs))
+
+seasonal_diff_temps <-  south_west %>%
+  mutate(diff12_avg_temp = difference(avg_temp, 12))
+
+# Test if additional differencing is needed
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp,
+                  unitroot_ndiffs))
+
+# Final confirmation with KPSS Test
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp, 
+                  unitroot_kpss))
+
+# Autoplot of the Seasonally Differenced Data
+seasonal_diff_temps %>%
+  filter(region == 'south_west') %>%
+  autoplot(diff12_avg_temp,
+           colour = 'seagreen') +
+  labs(title = 'Seasonally Differenced Avg Temp',
+       subtitle = 'South Western Region') +
+  theme_fivethirtyeight()
+```
+
+# Partial ACF Plot of South West US Temps, Seasonal Difference Applied
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+seasonal_diff_temps %>%
+  filter(region == 'south_west') %>%
+  gg_tsdisplay(diff12_avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of South Western US Temps',
+       subtitle = 'Seasonal difference')
+```
+
+#FITTING MODELS--South West REGION
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Calling the train,test,function defined (check the appendix)
+train_SW = train_test_fn(south_west)[[1]]
+test_SW = train_test_fn(south_west)[[2]]
+```
+
+#ETS MODEL
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#autofit ETS--CALLING THE (AUTO) ETS FUNCTION defined (check the appendix)
+ets_fit_SW = ETS_fn(train_SW)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#fit the best ETS-For South West it is (A,Ad,A)
+SW_holt_fit <- train_SW %>%
+  model(
+    additive_damped = ETS(avg_temp ~ error("A") + trend("Ad") + season("A"))
+  ) 
+
+#Check the residuals for white noise
+gg_tsresiduals(SW_holt_fit)
+
+#L jung test to confirm white noise
+augment(SW_holt_fit) %>% features(.innov, ljung_box, lag=24, dof=17)
+```
+
+# FORECAST
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Forecast for South West--(Calling the function we defined (check the appendix))
+#The output is accuracy scores and forecast graph
+forecast_fn(SW_holt_fit, south_west)
+```
+
+#FIT ARIMA MODELS for South West region by calling the functions (shown in the appendix)
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#call the ARIMA function for South East region--
+best_SW_model = arima.fn(train_SW, south_west)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#plot the best model
+model_SW = train_SW %>% model(ARIMA(avg_temp ~ pdq(2, 0, 0) + PDQ(3, 1, 0)))
+report(model_SW)
+
+#Residual diagnostics
+gg_tsresiduals(model_SW)
+
+#Check if the residuals have white noise by l_jung test-- prof said even if its not white noise, check residual diagnostics for both and then decide for both
+augment(model_SW) %>% features(.innov, ljung_box, lag=36, dof=6)
+```
+
+The forcast function below gives the RMSE for best arima which is 1.27 and the RMSE that auto ETS 
+model gives us 1.20, and looking at the residual diagnostics from both, it can be concluded that best_ARIMA-- <ARIMA(2,0,0)(3,1,0)[12]> might be the best model.
+But of course need to do the cross validation--
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Calling the forecast function(defined (check the appendix))--this plots the forecasts and gives the accuracy scores
+forecast_fn(model_SW, south_west)
+```
+
+#CROSS VALIDATION
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, eval= FALSE}
+print('South West CV')
+south_west%>%
+  stretch_tsibble(.init = 10) %>%
+  model(
+    additive_damped = ETS(avg_temp ~ error("A") + trend("Ad") + season("A")),
+    best_arima = ARIMA(avg_temp ~ pdq(2, 0, 0) + PDQ(3, 1, 0))
+  ) %>%
+  forecast(h = 1) %>%
+  accuracy(south_west) %>%
+  select(.model, RMSE:MAPE)
+```
+
+#Looking at region MIDWEST region
+
+Start by looking at all the plots
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#autoplot for Midwest region
+midwest %>%
+  autoplot(avg_temp, 
+           colour = 'yellow4')+ 
+  labs(title = 'Average Temperatures Midwest Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+
+#gg_season for Midwest region
+midwest %>%
+  gg_season(avg_temp,
+            labels = 'right') + 
+  labs(title = 'Average Temperatures by US Region',
+       subtitle = 'Midwest: 1913 - 2012',
+       y = 'avg_temp',
+       x = 'Year, Month') +
+  theme_fivethirtyeight() 
+
+#gg_subseries for Midwest region
+midwest %>%
+  gg_subseries(avg_temp, 
+               colour = 'yellow4')+ 
+  labs(title = 'Average Temperatures Midwest Region',
+       subtitle = '(1913 - 2012)',
+       y = 'avg_temp',
+       x = 'Year, Month')
+```
+
+# Perform an STL decomposition on Midwest region
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+stl_midwest_decom <- midwest %>%
+  model(STL(avg_temp ~ trend(window = 21) +
+              season(window = 13),
+            robust = TRUE)) %>%
+  components()
+autoplot(stl_midwest_decom, color ='yellow4') + 
+  xlab('Year') + 
+  ylab('Avg Temperature') +
+  ggtitle('STL Decomposition: USA Midwest Coast Temperature')
+```
+
+# Looking at the stationarity of the data followed by Model building
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Partial ACF Plot: Midwest US, No Differencing
+midwest %>%
+  gg_tsdisplay(avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of South West US Temps (no differencing)')
+```
+
+# Addressing the stationarity
+
+Perform nsdiffs test to determine if we need a seasonal difference
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# test the nsdiffs
+pander(midwest %>%
+         features(avg_temp, 
+                  unitroot_nsdiffs))
+
+seasonal_diff_temps <-  midwest %>%
+  mutate(diff12_avg_temp = difference(avg_temp, 12))
+
+# Test if additional differencing is needed
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp,
+                  unitroot_ndiffs))
+
+# Final confirmation with KPSS Test
+pander(seasonal_diff_temps %>%
+         features(diff12_avg_temp, 
+                  unitroot_kpss))
+
+# Autoplot of the Seasonally Differenced Data
+seasonal_diff_temps %>%
+  filter(region == 'midwest') %>%
+  autoplot(diff12_avg_temp,
+           colour = 'yellow4') +
+  labs(title = 'Seasonally Differenced Avg Temp',
+       subtitle = 'South Midwest Region') +
+  theme_fivethirtyeight()
+```
+
+# Partial ACF Plot of Midwest US Temps, Seasonal Difference Applied
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+seasonal_diff_temps %>%
+  filter(region == 'midwest') %>%
+  gg_tsdisplay(diff12_avg_temp,
+               plot_type = 'partial',
+               lag_max = 48) +
+  labs(title = 'ACF Plot of Midwest US Temps',
+       subtitle = 'Seasonal difference')
+```
+
+#FITTING MODELS--MIDWEST REGION
+
+#Calling the train,test,function defined (check the appendix)
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_midwest = train_test_fn(midwest)[[1]]
+test_SW = train_test_fn(midwest)[[2]]
+```
+
+#ETS MODEL
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#autofit ETS--CALLING THE (AUTO) ETS FUNCTION defined (check the appendix)
+ets_fit_midwest = ETS_fn(train_midwest)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#fit the best ETS-For Midwest it is (A,N,A)
+midwest_holt_fit <- train_midwest %>%
+  model(
+    additive = ETS(avg_temp ~ error("A") + trend("N") + season("A"))
+  ) 
+
+#Check the residuals for white noise
+gg_tsresiduals(midwest_holt_fit)
+
+#L jung test to confirm white noise
+augment(midwest_holt_fit) %>% features(.innov, ljung_box, lag=24, dof=15)
+```
+
+# FORECAST
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Forecast for Midwest--(Calling the function we defined (check the appendix))
+#The output is accuracy scores and forecast graph
+
+forecast_fn(midwest_holt_fit, midwest)
+```
+
+#FIT ARIMA MODELS for Midwest region by calling the functions (shown in the appendix)
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#call the ARIMA function for Midwest region--
+best_midwest_model = arima.fn(train_midwest, midwest)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#plot the best model
+model_midwest = train_midwest %>% model(ARIMA(avg_temp ~ pdq(1, 0, 0) + PDQ(3, 1, 0)))
+report(model_midwest)
+
+#Residual diagnostics
+gg_tsresiduals(model_midwest)
+
+#Check if the residuals have white noise by l_jung test-- prof said even if its not white noise, check residual diagnostics for both and then decide for both
+augment(model_midwest) %>% features(.innov, ljung_box, lag=36, dof=5)
+```
+
+The forcast function below gives the RMSE for best arima which is 2.05 and the RMSE that auto ETS 
+model gives us 1.82, and looking at the residual diagnostics from both, it can be concluded that best_ARIMA-- <ARIMA(1,0,0)(3,1,0)[12]> might be the best model.
+But of course need to do the cross validation--
+
+# FORECAST
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Calling the forecast function(defined (check the appendix))--this plots the forecasts and gives the accuracy scores
+forecast_fn(model_midwest, midwest)
+```
+
+# CROSS VALIDATION
+```{r echo=FALSE, message=FALSE, warning=FALSE, eval= FALSE} 
+print('Midwest CV')
+midwest%>%
+  stretch_tsibble(.init = 10) %>%
+  model(
+    additive = ETS(avg_temp ~ error("A") + trend("N") + season("A")),
+    best_arima = ARIMA(avg_temp ~ pdq(1, 0, 0) + PDQ(3, 1, 0))
+  ) %>%
+  forecast(h = 1) %>%
+  accuracy(midwest) %>%
+  select(.model, RMSE:MAPE)
+```
+
+
+
+# Next Steps
+
+In the future, to expand on this analysis, I would like to verify the forecast from 2013 to 2020 against the actual average temperatures available to date. I would also like to explore additional models for the data, such as TSLM.
+
+
+# Appendix
+
+Complete list of functions:
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#Function to set the training and testing window
+train_test_fn = function(region_df) {
+  train <- region_df %>%
+    filter(as.Date(year_month) < '2003-01-01')
+  
+  test <- region_df %>%
+    filter(as.Date(year_month) >= '2003-01-01')
+  
+  train_test = list(train,test)
+  return(train_test)
+}
+
+#ETS model function
+ETS_fn = function(region_df){
+  ets_fit <- region_df %>%
+    model(ETS(avg_temp))
+  pander(report(ets_fit))
+}
+
+# auto-arima only function
+auto_arima_fn = function(region_df){
+  aa_fit <- region_df %>%
+    model(ARIMA(avg_temp))
+  pander(report(aa_fit))
+}
+
+# FUNCTION for ARIMA Models--
+#function to get the best arima model
+arima.fn = function(region_df, region_orig) {
+  df <- data.frame(p=integer(),
+                   q=integer(), 
+                   P=integer(), 
+                   Q=integer(),
+                   aic = double(),
+                   stringsAsFactors=FALSE) 
+  
+  for(p in 0:3){
+    for(q in 0:3){
+      for(P in 0:3){
+        for(Q in 0:3){
+          fit <- region_df %>% model(ARIMA(avg_temp ~ pdq(p, 0, q) + PDQ(P, 1, Q)))
+          aic <- glance(fit)$AICc
+          if (!is.null(aic)) {
+            #print(aic)
+            df_new = data.frame(p, q, P, Q, aic)
+            df = rbind(df, df_new)
+          }
+        }
+      }
+    }
+  }
+  
+  df = df %>% arrange(aic)
+  
+  models <- region_df %>%
+    model(best_arima = ARIMA(avg_temp ~ pdq(df$p[1], 0, df$q[1]) + PDQ(df$P[1], 1, df$Q[1])),
+          auto_arima = ARIMA(avg_temp),
+          arima1  = ARIMA(avg_temp ~ pdq(df$p[2], 0, df$q[2]) + PDQ(df$P[2], 1, df$Q[2])),
+          arima2  = ARIMA(avg_temp ~ pdq(df$p[3], 0, df$q[3]) + PDQ(df$P[3], 1, df$Q[3])),
+          arima3  = ARIMA(avg_temp ~ pdq(df$p[4], 0, df$q[4]) + PDQ(df$P[4], 1, df$Q[4])),
+          additive_ets   = ETS(avg_temp   ~ error('A') + trend('N') + season('A')),
+          additive_damped   = ETS(avg_temp   ~ error('A') + trend('Ad') + season('A'))
+    )
+  pander(models %>% pivot_longer(!region, names_to = "Model name",
+                                 values_to = "Orders"))
+  
+  pander(glance(models) %>% arrange(AICc) %>% select(.model:BIC))
+  
+  best_models_list = as.data.frame(glance(models) %>% arrange(AICc) %>% select(.model:BIC)) %>% 
+    arrange(AICc)
+  return(best_models_list)
+  
+} #--end of function
+
+#function for forecast
+forecast_fn = function(model, region_orig){
+   forecast = model%>%
+    forecast(h= '10 years') 
+  
+   print(forecast %>% accuracy(region_orig) )
+   forecast %>% autoplot(region_orig, colour = 'maroon', size = 0.8)
+}
+```
+
+
